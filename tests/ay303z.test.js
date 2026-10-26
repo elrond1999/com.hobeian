@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const Module = require('node:module');
 const { EventEmitter } = require('node:events');
 const driver = require('../drivers/ay-303z/driver.compose.json');
+const manifest = require('../.homeycompose/app.json');
 
 class FakeDevice {
   constructor() {
@@ -14,6 +15,21 @@ class FakeDevice {
     this.logs = [];
     this.errors = [];
     this.error = (...args) => this.errors.push(args);
+    this.timers = [];
+    this.driver = { id: 'ay-303z' };
+    this.homey = {
+      manifest: { version: '1.0.11' },
+      setInterval: (callback) => {
+        this.timers.push(callback); return callback;
+      },
+      clearInterval: (callback) => {
+        this.timers = this.timers.filter((timer) => timer !== callback);
+      },
+    };
+  }
+
+  getName() {
+    return 'Test soil sensor';
   }
 
   log(...args) {
@@ -63,12 +79,20 @@ Module._load = function load(request, ...args) {
 };
 let AY303ZDevice;
 let ZG303ZDevice;
+let SoilApp;
 try {
+  const deviceLoad = Module._load;
+  Module._load = function load(request, ...args) {
+    if (request === 'homey') return { App: function FakeApp() {} };
+    return deviceLoad.call(this, request, ...args);
+  };
   // Load only after installing the Homey runtime mocks.
   // eslint-disable-next-line global-require
   AY303ZDevice = require('../.homeybuild/drivers/ay-303z/device');
   // eslint-disable-next-line global-require
   ZG303ZDevice = require('../.homeybuild/drivers/zg-303z/device');
+  // eslint-disable-next-line global-require
+  SoilApp = require('../.homeybuild/app');
 } finally {
   Module._load = originalLoad;
 }
@@ -204,7 +228,10 @@ async function sleepyFixture(Device = AY303ZDevice, previous) {
     if (cluster.failDp === dp) throw new Error('Wake window closed');
   };
   cluster.setDatapointEnum = async (dp, value) => writes.push({ dp, value });
-  const endpoint = { clusters: { tuya: cluster }, handleFrame() {} };
+  const endpoint = {
+    clusters: { tuya: cluster, temperatureMeasurement: new EventEmitter(), relativeHumidity: new EventEmitter() },
+    handleFrame() {},
+  };
   await device.onNodeInit({ zclNode: { endpoints: { 1: endpoint } } });
   return {
     device, writes, cluster, endpoint,
@@ -291,4 +318,134 @@ test('reported settings distinguish matching and mismatching sensor values in di
   assert.deepEqual(reports.map(([, details]) => ({
     raw: details.rawValue, requested: details.requestedRawValue, matches: details.matchesRequested,
   })), [{ raw: 60, requested: 300, matches: false }, { raw: 300, requested: 300, matches: true }]);
+});
+
+function rawReport(endpoint, dp, value) {
+  const frame = Buffer.alloc(13);
+  Buffer.from([0x19, 1, 2, 0, 1, dp, 2, 0, 4]).copy(frame);
+  frame.writeInt32BE(value, 9);
+  endpoint.handleFrame(0xef00, frame, {});
+}
+
+test('late diagnostics retain requested, failed, sent and reported settings after a restart', async (t) => {
+  let now = 100000;
+  t.mock.method(Date, 'now', () => now);
+  const first = await sleepyFixture();
+  await editSettings(first.device, { soil_sampling: 300 });
+  first.cluster.failDp = 112;
+  await first.device.onEndDeviceAnnounce();
+  now += 6000;
+  first.cluster.failDp = undefined;
+  await first.device.onEndDeviceAnnounce();
+  rawReport(first.endpoint, 112, 300);
+  now += 3600000;
+  await first.device.timers[0]();
+  const restarted = await sleepyFixture(AY303ZDevice, first.device);
+  const state = restarted.device.getDiagnosticsSnapshot();
+  assert.equal(state.settings.soil_sampling.requested, 300);
+  assert.equal(state.settings.soil_sampling.reported, 300);
+  assert.equal(state.settings.soil_sampling.attempts, 2);
+  assert.equal(state.settings.soil_sampling.failures, 1);
+  assert.deepEqual(state.events.map(({ kind }) => kind), ['requested', 'attempt', 'failed', 'attempt', 'sent', 'reported']);
+  assert.deepEqual(state.pending, {});
+  assert.equal(state.starts, 2);
+  assert.deepEqual(restarted.writes, []);
+});
+
+test('diagnostics distinguish unchanged reports, changes, native values and unknown datapoints', async (t) => {
+  let now = 100000;
+  t.mock.method(Date, 'now', () => now);
+  const {
+    device, endpoint, cluster, writes,
+  } = await sleepyFixture();
+  rawReport(endpoint, 3, 37);
+  // A duplicate cluster notification for the intercepted packet is not a new report.
+  cluster.emit('response', { dp: 3, datatype: 2, data: Buffer.from([0, 0, 0, 37]) });
+  now += 60000;
+  rawReport(endpoint, 3, 37);
+  now += 60000;
+  rawReport(endpoint, 3, 36);
+  endpoint.clusters.relativeHumidity.emit('attr.measuredValue', 9000);
+  endpoint.clusters.temperatureMeasurement.emit('attr.measuredValue', 2230);
+  rawReport(endpoint, 109, 52);
+  rawReport(endpoint, 200, 1234);
+  const state = device.getDiagnosticsSnapshot();
+  const soil = state.channels['tuya.dp3.type2'];
+  assert.equal(soil.count, 3);
+  assert.equal(soil.changes, 1);
+  assert.equal(soil.meanIntervalMs, 60000);
+  assert.equal(soil.maxIntervalMs, 60000);
+  assert.equal(soil.lastChangedAt, 220000);
+  assert.equal(state.channels['native.humidity'].value, 9000);
+  assert.equal(state.channels['native.temperature'].value, 2230);
+  assert.equal(state.channels['unknown.dp200.type2'].value, '000004d2');
+  assert.equal(device.values.measure_humidity, 52);
+  assert.equal(device.values.measure_temperature, undefined);
+  assert.deepEqual(writes, []);
+});
+
+test('diagnostics bound retained events and payloads while keeping the latest setting status', async () => {
+  const { device, endpoint } = await sleepyFixture();
+  await editSettings(device, { humidity_calibration: -28 });
+  for (let value = 0; value < 80; value += 1) rawReport(endpoint, 112, value);
+  endpoint.handleFrame(0x0405, Buffer.alloc(200, 0xaa), {});
+  const state = device.getDiagnosticsSnapshot();
+  assert.equal(state.settings.humidity_calibration.requested, -28);
+  assert.equal(state.settings.soil_sampling.reported, 79);
+  assert.equal(state.events.length, 32);
+  assert.equal(state.frames.length, 8);
+  assert.equal(state.frames[7].hex.length, 160);
+  assert.equal(state.frames[7].truncated, true);
+});
+
+test('a later periodic summary includes earlier setting attempts without another write', async () => {
+  const { device, writes } = await sleepyFixture();
+  await editSettings(device, { temperature_sampling: 300 });
+  await device.timers[0]();
+  const [, json] = device.logs.find(([message]) => message === 'SOIL_DIAGNOSTICS');
+  const summary = JSON.parse(json);
+  assert.equal(summary.settings.temperature_sampling.requested, 300);
+  assert.equal(summary.pending.temperature_sampling.value, 300);
+  assert.equal(summary.frames, undefined);
+  assert.deepEqual(writes, []);
+  await device.onDeleted();
+  assert.equal(device.timers.length, 0);
+});
+
+test('the authenticated diagnostics route exports current readings and history without sensor traffic', async () => {
+  const { device, endpoint, writes } = await sleepyFixture();
+  rawReport(endpoint, 5, 211);
+  await device.timers[0]();
+  await editSettings(device, { soil_sampling: 300 });
+  const app = new SoilApp();
+  app.homey = {
+    manifest: { version: '1.0.11' },
+    drivers: { getDrivers: () => ({ 'ay-303z': { getDevices: () => [device] } }) },
+  };
+  // eslint-disable-next-line global-require
+  const api = require('../.homeybuild/api');
+  const result = await api.getSoilDiagnostics({ homey: { app } });
+  assert.equal(result.appVersion, '1.0.11');
+  assert.equal(result.devices.length, 1);
+  assert.equal(result.devices[0].name, 'Test soil sensor');
+  assert.equal(result.devices[0].channels['tuya.dp5.type2'].value, 211);
+  assert.equal(result.devices[0].settings.soil_sampling.requested, 300);
+  assert.equal(result.devices[0].identity.firmware, null);
+  assert.equal(manifest.api.getSoilDiagnostics.method, 'GET');
+  assert.equal(manifest.api.getSoilDiagnostics.path, '/diagnostics');
+  assert.notEqual(manifest.api.getSoilDiagnostics.public, true);
+  assert.deepEqual(writes, []);
+});
+
+test('capability publication errors remain visible separately from incoming measurement reports', async () => {
+  const { device, endpoint } = await sleepyFixture();
+  device.setCapabilityValue = async () => {
+    throw new Error('Homey rejected update');
+  };
+  rawReport(endpoint, 5, 211);
+  await device.timers[0]();
+  const state = device.getDiagnosticsSnapshot();
+  assert.equal(state.channels['tuya.dp5.type2'].count, 1);
+  assert.equal(state.channels['homey.measure_temperature'], undefined);
+  assert.ok(state.errors.some(({ context, message }) => context === 'Capability measure_temperature' && message.includes('Homey rejected update')));
 });

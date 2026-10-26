@@ -31,5 +31,8 @@
   },
   "1.0.10": {
     "en": "Improve AY-303Z and ZG-303Z settings delivery: retry failed changes after wake-up, preserve pending changes across app restarts, and add diagnostics for requested and sensor-reported settings. Includes refreshed app descriptions and device photos."
+  },
+  "1.0.11": {
+    "en": "Retain soil sensor settings history and report timing across restarts, add copyable diagnostics in app settings, and observe native Zigbee reports alongside Tuya datapoints. Reduce repetitive logs so reports remain useful when submitted later."
   }
 }

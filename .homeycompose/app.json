@@ -1,6 +1,6 @@
 {
   "id": "com.hobeian",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "compatibility": ">=12.4.0",
   "sdk": 3,
   "platforms": [
@@ -46,5 +46,11 @@
   "support": "https://github.com/AreAArseth/com.hobeian/issues",
   "contributing": {
     "url": "https://github.com/AreAArseth/com.hobeian/blob/main/CONTRIBUTING.md"
+  },
+  "api": {
+    "getSoilDiagnostics": {
+      "method": "GET",
+      "path": "/diagnostics"
+    }
   }
 }

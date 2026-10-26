@@ -7,6 +7,18 @@ Historical entries are reconstructed from `.homeychangelog.json` and the previou
 
 ## [Unreleased]
 
+## [1.0.11] - 2026-10-26
+
+### Added
+
+- Copyable/downloadable soil sensor diagnostics in the app settings, with an authenticated read-only API.
+- Retained settings requests, attempts, failures and sensor readbacks, plus per-datapoint report/change counts and timing across restarts.
+- Passive observations of native temperature/humidity clusters, unknown Tuya datapoints, bounded raw payloads and Homey capability update failures.
+
+### Changed
+
+- Replace repetitive soil sensor frame/value logging with a compact diagnostic summary every two minutes. Measurement snapshots are checkpointed at that interval; settings events are saved immediately.
+
 ## [1.0.10] - 2026-10-26
 
 ### Fixed
@@ -93,7 +105,8 @@ Historical entries are reconstructed from `.homeychangelog.json` and the previou
 
 - Initial ZG-303Z soil sensor support with soil moisture, temperature, humidity, battery level, and water shortage alarm.
 
-[Unreleased]: https://github.com/elrond1999/com.hobeian/compare/v1.0.10...HEAD
+[Unreleased]: https://github.com/elrond1999/com.hobeian/compare/v1.0.11...HEAD
+[1.0.11]: https://github.com/elrond1999/com.hobeian/compare/v1.0.10...v1.0.11
 [1.0.10]: https://github.com/elrond1999/com.hobeian/compare/v1.0.9...v1.0.10
 [1.0.9]: https://github.com/elrond1999/com.hobeian/compare/v1.0.8...v1.0.9
 [1.0.8]: https://github.com/elrond1999/com.hobeian/compare/f6b925c...v1.0.8

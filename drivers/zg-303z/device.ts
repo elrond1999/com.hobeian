@@ -16,8 +16,13 @@ import {
   toTuyaTemperatureCalibrationTenths,
 } from '../../lib/zg303z';
 import { DP_HANDLERS, DP_WRITE, DEFAULTS } from '../../lib/zg303zDatapoints';
+import SoilDiagnostics from '../../lib/soilDiagnostics';
 
 const PENDING_SETTINGS_STORE_KEY = 'soilSensorPendingSettings';
+const DIAGNOSTICS_STORE_KEY = 'soilSensorDiagnostics';
+const DIAGNOSTICS_INTERVAL_MS = 120000;
+const NATIVE_TEMPERATURE_CLUSTER = 0x0402;
+const NATIVE_HUMIDITY_CLUSTER = 0x0405;
 const SETTING_WRITES = {
   temperature_sampling: { dp: 'TEMP_SAMPLING_INTERVAL', convert: toTuyaSamplingSeconds, fallback: DEFAULTS.SAMPLING_SECONDS },
   soil_sampling: { dp: 'SOIL_SAMPLING_INTERVAL', convert: toTuyaSamplingSeconds, fallback: DEFAULTS.SAMPLING_SECONDS },
@@ -42,10 +47,29 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
   private pendingStoreWrite: Promise<void> = Promise.resolve();
   private endpoint1: any = null;
   private lastWakeHandledAt = 0;
+  private diagnostics = new SoilDiagnostics();
+  private diagnosticTimer?: NodeJS.Timeout;
+  private diagnosticStoreWrite: Promise<void> = Promise.resolve();
+  private interceptsRawTuya = false;
 
   async onNodeInit({ zclNode }: { zclNode: any }) {
     this.log('ZG-303Z device initialized');
     this.pendingSettings = this.getStoreValue(PENDING_SETTINGS_STORE_KEY) ?? {};
+    this.diagnostics = new SoilDiagnostics(this.getStoreValue(DIAGNOSTICS_STORE_KEY));
+    const { node } = this as any;
+    this.diagnostics.start({
+      manufacturer: node?.manufacturerName ?? null,
+      model: node?.productId ?? null,
+      receiveWhenIdle: node?.receiveWhenIdle ?? null,
+      firmware: node?.softwareBuildId ?? null,
+      integrationVersion: this.homey.manifest.version,
+    });
+    if (this.diagnosticTimer) this.homey.clearInterval(this.diagnosticTimer);
+    this.diagnosticTimer = this.homey.setInterval(() => {
+      this.log('SOIL_DIAGNOSTICS', JSON.stringify(this.getDiagnosticsSnapshot(false)));
+      return this.persistDiagnostics().catch(this.error);
+    }, DIAGNOSTICS_INTERVAL_MS);
+    await this.persistDiagnostics().catch(this.error);
     this.log('Soil sensor settings at startup', {
       configured: this.getSettings(),
       pending: this.pendingSettings,
@@ -67,6 +91,12 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
       return;
     }
     this.endpoint1 = endpoint;
+    for (const [name, channel] of [['temperatureMeasurement', 'native.temperature'], ['relativeHumidity', 'native.humidity']]) {
+      endpoint.clusters[name]?.on('attr.measuredValue', (value: number) => this.diagnostics.sample(channel, value));
+    }
+    for (const attribute of ['manufacturerName', 'modelId', 'appVersion']) {
+      endpoint.clusters.basic?.on(`attr.${attribute}`, (value: string | number) => this.diagnostics.identify(attribute === 'appVersion' ? 'deviceAppVersion' : attribute, value));
+    }
 
     // Detect if this is a sleepy (battery-powered) device
     const isSleepy = this.isDeviceSleepy();
@@ -133,8 +163,65 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
   private async writeSetting(key: SettingKey, value: number): Promise<void> {
     const dp = this.writeDatapoints[SETTING_WRITES[key].dp];
     this.log('Sending soil sensor setting', { key, dp, rawValue: value });
-    await this.tuyaCluster.setDatapointValue(dp, value);
+    this.diagnostics.setting({
+      kind: 'attempt', key, dp, value,
+    });
+    await this.persistDiagnostics().catch(this.error);
+    try {
+      await this.tuyaCluster.setDatapointValue(dp, value);
+      this.diagnostics.setting({
+        kind: 'sent', key, dp, value,
+      });
+    } catch (error) {
+      this.diagnostics.setting({
+        kind: 'failed', key, dp, value, error: String(error).slice(0, 240),
+      });
+      this.persistDiagnostics().catch(this.error);
+      throw error;
+    }
+    this.persistDiagnostics().catch(this.error);
     this.log('Soil sensor setting sent (device value not yet confirmed)', { key, dp, rawValue: value });
+  }
+
+  private persistDiagnostics(): Promise<void> {
+    const snapshot = this.diagnostics.snapshot();
+    const write = this.diagnosticStoreWrite.then(() => this.setStoreValue(DIAGNOSTICS_STORE_KEY, snapshot));
+    this.diagnosticStoreWrite = write.catch(() => {});
+    return write;
+  }
+
+  private async publishCapability(capability: string, value: number | boolean): Promise<void> {
+    try {
+      await this.setCapabilityValue(capability, value);
+      this.diagnostics.sample(`homey.${capability}`, value);
+    } catch (error) {
+      this.diagnostics.error(`Capability ${capability}`, error);
+      throw error;
+    }
+  }
+
+  // Used by the authenticated app settings API; exporting never sends radio commands.
+  getDiagnosticsSnapshot(includeFrames = true) {
+    const state = this.diagnostics.snapshot();
+    const now = Date.now();
+    return {
+      name: this.getName(),
+      driver: this.driver.id,
+      clusters: Object.keys(this.endpoint1?.clusters ?? {}),
+      expectedTuyaDatapoints: this.datapointHandlers,
+      generatedAt: new Date(now).toISOString(),
+      ...state,
+      configured: this.getSettings(),
+      pending: { ...this.pendingSettings },
+      lastFrameAgeMs: state.lastFrameAt === undefined ? null : Math.max(0, now - state.lastFrameAt),
+      channels: Object.fromEntries(Object.entries(state.channels).map(([key, value]) => [key, {
+        ...value,
+        ageMs: Math.max(0, now - value.lastAt),
+        meanIntervalMs: value.count < 2 ? null : Math.round(value.totalIntervalMs / (value.count - 1)),
+      }])),
+      frames: includeFrames ? state.frames : undefined,
+      events: includeFrames ? state.events : state.events.slice(-6),
+    };
   }
 
   private persistPendingSettings(): Promise<void> {
@@ -180,17 +267,14 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
 
     // Listen for datapoint reports
     this.tuyaCluster.on('reporting', (args: any) => {
-      this.log('Tuya reporting event:', args);
       this.processTuyaReport(args);
     });
 
     this.tuyaCluster.on('response', (args: any) => {
-      this.log('Tuya response event:', args);
       this.processTuyaReport(args);
     });
 
     this.tuyaCluster.on('datapoint', (args: any) => {
-      this.log('Tuya datapoint event:', args);
       this.processTuyaReport(args);
     });
   }
@@ -206,10 +290,13 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
     // Intercept handleFrame for the Tuya cluster
     const originalHandleFrame = endpoint.handleFrame?.bind(endpoint);
     if (originalHandleFrame) {
+      this.interceptsRawTuya = true;
       endpoint.handleFrame = (clusterId: number, frame: Buffer, meta: any) => {
+        const observedClusters: number[] = [TUYA_CLUSTER_ID, NATIVE_TEMPERATURE_CLUSTER, NATIVE_HUMIDITY_CLUSTER];
+        if (observedClusters.includes(clusterId)) {
+          this.diagnostics.frame(clusterId, frame);
+        }
         if (clusterId === TUYA_CLUSTER_ID) {
-          this.log('Raw Tuya frame received, cluster:', clusterId);
-          this.log('Frame data:', frame.toString('hex'));
           this.parseRawTuyaFrame(frame);
 
           // Device is awake since we received data - trigger wake handler
@@ -220,19 +307,6 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
       this.log('Registered raw frame handler for Tuya cluster');
     }
 
-    // Also try to use the cluster report handler
-    if (endpoint.clusters) {
-      for (const [name, cluster] of Object.entries(endpoint.clusters)) {
-        const cl = cluster as any;
-        if (typeof cl.onReport === 'function') {
-          const originalOnReport = cl.onReport.bind(cl);
-          cl.onReport = (args: any) => {
-            this.log(`Cluster ${name} report:`, args);
-            return originalOnReport(args);
-          };
-        }
-      }
-    }
   }
 
   /**
@@ -241,16 +315,16 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
   private parseRawTuyaFrame(frame: Buffer) {
     try {
       const decoded = decodeTuyaDpValuesFromZclFrame(frame);
-      if (decoded.dpValues.length === 0) return;
-
-      this.log(
-        `Decoded Tuya frame: cmd=${decoded.commandId} status=${decoded.status} transid=${decoded.transid} dpCount=${decoded.dpValues.length}`,
-      );
+      if (decoded.dpValues.length === 0) {
+        this.diagnostics.sample(`tuya.command${decoded.commandId}.withoutDatapoints`, decoded.status ?? -1);
+        return;
+      }
 
       for (const dpValue of decoded.dpValues) {
         this.processDataPoint(dpValue.dp, dpValue.datatype, dpValue.data);
       }
     } catch (error) {
+      this.diagnostics.error('Tuya frame decode', error);
       this.error('Error parsing raw Tuya frame:', error);
     }
   }
@@ -259,9 +333,8 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
    * Process a Tuya report
    */
   private processTuyaReport(args: any) {
-    if (!args) return;
-
-    this.log('Processing Tuya report:', JSON.stringify(args));
+    // The same packet must not be counted twice if the cluster also emits an event.
+    if (!args || this.interceptsRawTuya) return;
 
     const { dp, datatype, data } = args;
 
@@ -296,29 +369,25 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
    */
   private processDataPoint(dp: number, datatype: number, data: Buffer) {
     const mapping = this.datapointHandlers[dp];
-
     if (!mapping) {
-      this.log(`Unknown DP ${dp} (type: ${datatype})`);
+      this.diagnostics.sample(`unknown.dp${dp}.type${datatype}`, data.subarray(0, 80).toString('hex'));
       return;
     }
-
     const rawValue = this.parseDpValue(datatype, data);
+    this.diagnostics.sample(`tuya.dp${dp}.type${datatype}`, rawValue);
 
     // Apply divideBy transformation if specified in mapping
     const value = mapping.divideBy && typeof rawValue === 'number'
       ? rawValue / mapping.divideBy
       : rawValue;
 
-    this.log(`Processing DP ${dp} = ${value} (handler: ${mapping.handler})`);
-
     // Dispatch based on handler type
     switch (mapping.handler) {
       case 'temperature':
         if (typeof rawValue === 'number') {
           const tempC = rawTemperatureTimes10ToCelsius(rawValue);
-          this.log(`Setting temperature to ${tempC}°C`);
           if (this.hasCapability('measure_temperature')) {
-            this.setCapabilityValue('measure_temperature', tempC).catch(this.error);
+            this.publishCapability('measure_temperature', tempC).catch(this.error);
           }
         }
         break;
@@ -328,9 +397,8 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
           const soilMoisture = clampPercent(value);
           this.lastSoilMoisturePercent = soilMoisture;
 
-          this.log(`Setting soil moisture to ${soilMoisture}%`);
           if (this.hasCapability('measure_soil_moisture')) {
-            this.setCapabilityValue('measure_soil_moisture', soilMoisture).catch(this.error);
+            this.publishCapability('measure_soil_moisture', soilMoisture).catch(this.error);
           }
 
           // Some models use a hardware alarm instead of this local fallback.
@@ -340,9 +408,8 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
               soilMoisturePercent: soilMoisture,
               thresholdPercent: threshold,
             });
-            this.log(`Setting water alarm to ${alarm} (threshold ${threshold}%)`);
             if (this.hasCapability('alarm_water')) {
-              this.setCapabilityValue('alarm_water', alarm).catch(this.error);
+              this.publishCapability('alarm_water', alarm).catch(this.error);
             }
           }
         }
@@ -351,9 +418,8 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
       case 'battery':
         if (typeof value === 'number') {
           const battery = clampPercent(value);
-          this.log(`Setting battery to ${battery}%`);
           if (this.hasCapability('measure_battery')) {
-            this.setCapabilityValue('measure_battery', battery).catch(this.error);
+            this.publishCapability('measure_battery', battery).catch(this.error);
           }
         }
         break;
@@ -361,9 +427,8 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
       case 'humidity':
         if (typeof value === 'number') {
           const humidity = clampPercent(value);
-          this.log(`Setting humidity to ${humidity}%`);
           if (this.hasCapability('measure_humidity')) {
-            this.setCapabilityValue('measure_humidity', humidity).catch(this.error);
+            this.publishCapability('measure_humidity', humidity).catch(this.error);
           }
         }
         break;
@@ -371,9 +436,8 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
       case 'waterWarning':
         if (typeof value === 'number' || typeof value === 'boolean') {
           const alarm = value === 1 || value === true;
-          this.log(`Setting water alarm to ${alarm}`);
           if (this.hasCapability('alarm_water')) {
-            this.setCapabilityValue('alarm_water', alarm).catch(this.error);
+            this.publishCapability('alarm_water', alarm).catch(this.error);
           }
         }
         break;
@@ -383,7 +447,12 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
           const key = (Object.keys(SETTING_WRITES) as SettingKey[])
             .find((candidate) => this.writeDatapoints[SETTING_WRITES[candidate].dp] === dp);
           const config = key ? SETTING_WRITES[key] : undefined;
-          const requested = config && key ? config.convert(this.getSetting(key) ?? config.fallback) : undefined;
+          const requested = config && key ? this.pendingSettings[key]?.value
+            ?? this.diagnostics.requested(key) ?? config.convert(this.getSetting(key) ?? config.fallback) : undefined;
+          const changed = this.diagnostics.setting({
+            kind: 'reported', dp, key: key ?? `dp${dp}`, value, requested,
+          });
+          if (changed) this.persistDiagnostics().catch(this.error);
           this.log('Soil sensor reported setting', {
             dp,
             key,
@@ -408,13 +477,15 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
     }
 
     try {
+      this.diagnostics.batteryRead();
       const batteryStatus = await endpoint.clusters[CLUSTER.POWER_CONFIGURATION.NAME].readAttributes(['batteryPercentageRemaining']);
       if (batteryStatus.batteryPercentageRemaining !== undefined) {
         const battery = Math.round(batteryStatus.batteryPercentageRemaining / 2);
-        this.log('Battery level:', battery, '%');
-        await this.setCapabilityValue('measure_battery', battery);
+        await this.publishCapability('measure_battery', battery);
       }
     } catch (err) {
+      this.diagnostics.batteryRead(true);
+      this.diagnostics.error('Battery read', err);
       this.log('Could not read battery (device may be sleeping):', err);
     }
   }
@@ -433,9 +504,13 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
       if (!changedKeys.includes(key)) continue;
       const config = SETTING_WRITES[key];
       this.pendingSettings[key] = { value: config.convert(newSettings[key] ?? config.fallback) };
+      this.diagnostics.setting({
+        kind: 'requested', key, dp: this.writeDatapoints[config.dp], value: this.pendingSettings[key]!.value,
+      });
       this.log('Queued soil sensor setting', { key, requested: newSettings[key], rawValue: this.pendingSettings[key]?.value });
     }
     await this.persistPendingSettings();
+    await this.persistDiagnostics().catch(this.error);
     if (!this.isDeviceSleepy()) await this.applyPendingSettings();
 
     // Only models using the local fallback recompute before hardware confirms.
@@ -458,6 +533,7 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
    * Clean up on device removal
    */
   async onDeleted() {
+    if (this.diagnosticTimer) this.homey.clearInterval(this.diagnosticTimer);
     this.log('ZG-303Z device deleted');
   }
 
@@ -507,12 +583,9 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
     const DEBOUNCE_MS = 5000;
 
     if (now - this.lastWakeHandledAt < DEBOUNCE_MS) {
-      this.log('Skipping duplicate wake handling (debounce)');
       return;
     }
     this.lastWakeHandledAt = now;
-
-    this.log('Handling device wake-up');
 
     // Mark device as available
     await this.setAvailable().catch(this.error);

@@ -97,6 +97,31 @@ Reports water leaks, tamper status, low-battery alarms, and battery level. Uses 
 
 ## Releasing
 
+### Retained diagnostics (1.0.11)
+
+Open the Hobeian app's **Configure** page to refresh, copy, or download the JSON summary. This uses an authenticated, read-only app API and sends no Zigbee commands. It covers AY-303Z and ZG-303Z only. Snapshots identify each sensor by its Homey name and driver; manufacturer/model and firmware are included when available passively. Firmware can be null; ask for the device-information screenshot in that case.
+
+Settings history and latest per-setting status survive restarts. Measurement/native-cluster summaries and the last eight payloads (up to 80 bytes each) are saved every two minutes, so an abrupt restart can lose the most recent two minutes of observation. History is bounded to 32 settings events and 64 channels per sensor; repeated identical readbacks update their last-seen time without flooding history or persistent writes. Uninstalling the app clears its stored data.
+
+The standard app diagnostic report also receives a `SOIL_DIAGNOSTICS` summary every two minutes. Copy/download is preferred when there are many devices or very late submission, since Homey's standard report retains only recent log output. Full copied JSON includes the bounded raw payload history; the periodic log omits it. Counters begin with installation of this version, and mean/maximum intervals include time when the app was stopped. `lastAt` and `lastChangedAt` are distinct; `homey.*` channels count successful SDK publications, not changes to the UI timestamp.
+
+For issue #22, leave calibration fixed, change one sensor's sampling intervals once, let it run for several hours, and then copy/download diagnostics. Exact timing is unnecessary. Note approximately when a brief button press was tried and whether values changed; do not reset/re-pair. If copied text is inconvenient, submit a normal app report after at least two minutes of running.
+
+### Working hypotheses for issue #22
+
+| Hypothesis | Evidence to distinguish it |
+| --- | --- |
+| Homey's displayed age reflects unchanged values rather than absent reports | Compare received count/lastAt, changes/lastChangedAt, and successful `homey.*` publications. The first report already shows repeated one-minute soil values. |
+| Firmware sampling interval differs from transmission cadence or change thresholds | Compare desired settings, sent attempts, dated sensor readbacks, and actual per-datapoint intervals. Related CS-201Z users report firmware-dependent/change-triggered behavior; this is not proof for this AY-303Z firmware. |
+| Setting ignored, rejected, reverted, or missed its wake window | Retained requested/attempt/sent/failed/reported records distinguish transport errors from unconfirmed commands and later mismatches. Never infer acceptance from a successful send. |
+| Firmware sends climate data on native clusters or different Tuya datapoints | Record native `0x0402`/`0x0405`, expected/unknown DPs, types and bounded payloads separately. Do not use native humidity as ambient humidity automatically: on the AY-303Z it may represent soil moisture. |
+| Firmware/initialization differs between the formerly generic sensor and newer units | Compare manufacturer/model/firmware, available clusters, starts, first-arrival patterns and temperature-unit readbacks (AY DP9). The existing first-pair magic-attribute path also deserves a separate protocol audit if climate data never arrives. |
+| Homey rejects capability updates | Incoming Tuya samples remain visible independently of `homey.*` successful-publication counts and retained capability errors. |
+| Intermittent radio/network trouble | Compare last-frame age, longest gaps, per-DP gaps and write/battery-read errors. One healthy five-minute window does not exclude longer outages. No RSSI/LQI conclusion is made without supporting metadata. |
+| Sensor accuracy, placement, or calibration differs from the reference | Keep offsets fixed; compare settled readings next to a reference away from wet soil/pot microclimates, with the same placement for all devices. Do not treat air humidity and soil moisture as interchangeable. |
+
+Protocol references: [AY-303Z ZHA contribution](https://github.com/zigpy/zha-device-handlers/pull/5352) and [CS-201Z user/firmware reports](https://github.com/Koenkk/zigbee2mqtt/discussions/27830). These support hypotheses, not a confirmed cause in issue #22. No polling, conversion, calibration-range, or reporting-configuration change is included in 1.0.11.
+
 ### AY-303Z issue #22 test procedure (1.0.10)
 
 Install the Test version without removing or re-pairing existing devices. On one AY-303Z, change both sampling intervals from 60 to 300 seconds and save. Leave calibration unchanged for this first test. Pending writes wait for an incoming report or device announce and survive an app restart. Failed writes remain queued; a successful send is not proof that firmware accepted the value.

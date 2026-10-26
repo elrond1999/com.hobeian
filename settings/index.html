@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script src="/homey.js" data-origin="settings"></script>
+    <style>
+      body { margin: 0; padding: 20px; font: 16px/1.5 system-ui, sans-serif; color: #17212b; background: #fff; }
+      main { max-width: 800px; margin: auto; }
+      h1 { font-size: 24px; margin: 0 0 12px; }
+      p { margin: 0 0 16px; }
+      .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+      button { padding: 11px 16px; border-radius: 8px; border: 1px solid #aeb9c4; font: inherit; background: #f3f6f9; color: #17212b; cursor: pointer; }
+      #copy { background: #176bad; color: white; border-color: #176bad; }
+      button:disabled { opacity: .5; cursor: default; }
+      button:focus-visible, textarea:focus-visible { outline: 3px solid #2084d1; outline-offset: 3px; }
+      textarea { box-sizing: border-box; width: 100%; min-height: 340px; padding: 12px; border: 1px solid #aeb9c4; border-radius: 8px; font: 12px/1.5 ui-monospace, monospace; resize: vertical; }
+      #status { min-height: 24px; }
+      .help { color: #465768; font-size: 14px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Soil sensor diagnostics</h1>
+      <p>Collect a summary for AY-303Z and ZG-303Z sensors after testing. It remembers recent settings attempts and report timing, so you do not need to capture an exact moment.</p>
+      <div class="actions">
+        <button id="refresh" type="button">Refresh</button>
+        <button id="copy" type="button" disabled>Copy diagnostics</button>
+        <button id="download" type="button" disabled>Download file</button>
+      </div>
+      <p id="status" role="status" aria-live="polite">Loading diagnostics…</p>
+      <label for="diagnostics">Diagnostic summary</label>
+      <textarea id="diagnostics" readonly spellcheck="false"></textarea>
+      <p class="help">Share the copied text or downloaded file with the app developer. It includes sensor names, settings, readings, and recent Zigbee payloads. Nothing is sent automatically. Measurement summaries are saved about every two minutes; settings activity is saved as it happens. Keep the app installed to retain its history.</p>
+    </main>
+    <script>
+      function onHomeyReady(Homey) {
+        const output = document.getElementById('diagnostics');
+        const status = document.getElementById('status');
+        const refresh = document.getElementById('refresh');
+        const copy = document.getElementById('copy');
+        const download = document.getElementById('download');
+        function load() {
+          refresh.disabled = true;
+          copy.disabled = true;
+          download.disabled = true;
+          status.textContent = 'Loading diagnostics…';
+          Homey.api('GET', '/diagnostics', null, function (error, result) {
+            refresh.disabled = false;
+            if (error) {
+              output.value = '';
+              status.textContent = 'Could not load diagnostics: ' + String(error.message || error);
+              return;
+            }
+            output.value = JSON.stringify(result, null, 2);
+            copy.disabled = false;
+            download.disabled = false;
+            status.textContent = result.devices.length
+              ? 'Ready. ' + result.devices.length + ' soil sensor(s). Copy or download this summary.'
+              : 'No AY-303Z or ZG-303Z sensors are paired with this app.';
+          });
+        }
+        refresh.addEventListener('click', load);
+        copy.addEventListener('click', async function () {
+          try {
+            await navigator.clipboard.writeText(output.value);
+            status.textContent = 'Diagnostics copied. You can paste them into your support reply.';
+          } catch (error) {
+            output.focus();
+            output.select();
+            status.textContent = 'Automatic copying is unavailable. The text is selected; copy it manually or use Download file.';
+          }
+        });
+        download.addEventListener('click', function () {
+          const url = URL.createObjectURL(new Blob([output.value], { type: 'application/json' }));
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = 'hobeian-soil-diagnostics.json';
+          link.click();
+          setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+          status.textContent = 'Download requested. Attach the JSON file to your support reply.';
+        });
+        Homey.ready();
+        load();
+      }
+    </script>
+  </body>
+</html>

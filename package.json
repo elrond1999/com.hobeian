@@ -1,6 +1,6 @@
 {
   "name": "com.hobeian",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "scripts": {
     "build": "npx --no-install tsc",
     "lint": "npx --no-install eslint --ext .js,.ts --ignore-path .gitignore --ignore-pattern \"types/**\" --ignore-pattern \".homeybuild/**\" .",
