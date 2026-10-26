@@ -97,6 +97,16 @@ Reports water leaks, tamper status, low-battery alarms, and battery level. Uses 
 
 ## Releasing
 
+### AY-303Z issue #22 test procedure (1.0.10)
+
+Install the Test version without removing or re-pairing existing devices. On one AY-303Z, change both sampling intervals from 60 to 300 seconds and save. Leave calibration unchanged for this first test. Pending writes wait for an incoming report or device announce and survive an app restart. Failed writes remain queued; a successful send is not proof that firmware accepted the value.
+
+Observe readings for 40 minutes. Immediately after a reading arrives, or after trying one brief button press, create an **app** diagnostic report through Apps → Hobeian → settings → Create Diagnostics Report. Share the report ID, sensor name, test start time, and whether the brief press caused an update. A brief press is reported to trigger an upload on the related CS-201Z but is unverified for the AY-303Z; do not hold the button or reset the device.
+
+Look for `Queued soil sensor setting`, `Sending soil sensor setting`, write failures, and `Soil sensor reported setting`. For sampling DPs 111 and 112, compare `rawValue` with `requestedRawValue` (300). A successful send without a matching report remains unconfirmed. Received measurement DPs are logged even if the numerical reading does not change. Diagnostic reports contain a limited recent log window; ask for a report promptly after the relevant event.
+
+### Release workflow
+
 Maintain the human-readable release history in [CHANGELOG.md](../CHANGELOG.md). Add notable changes under `Unreleased`, grouped by `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, or `Security` as needed. When preparing a release, move those entries into a dated version section and update the comparison links. Use the same user-facing summary for the Homey version workflow, which updates `.homeychangelog.json` for the App Store.
 
 1. Merge the release changes into `main` and confirm the **Validate Homey App** workflow passes. Run `npm ci && npm test` for the exact code being released; the validation workflow does not run these tests.

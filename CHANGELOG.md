@@ -7,8 +7,16 @@ Historical entries are reconstructed from `.homeychangelog.json` and the previou
 
 ## [Unreleased]
 
+## [1.0.10] - 2026-10-26
+
+### Fixed
+
+- AY-303Z and ZG-303Z user settings retain failed writes for the next wake, survive app restarts, and preserve edits made while a previous value is being sent.
+- Settings changes send only the edited values, avoiding a full configuration rewrite during a short wake window.
+
 ### Added
 
+- Diagnostic logs distinguish requested settings, sent commands, and matching or mismatching settings reported by the sensor.
 - Dedicated release history in CHANGELOG.md.
 
 ### Changed
@@ -85,7 +93,8 @@ Historical entries are reconstructed from `.homeychangelog.json` and the previou
 
 - Initial ZG-303Z soil sensor support with soil moisture, temperature, humidity, battery level, and water shortage alarm.
 
-[Unreleased]: https://github.com/elrond1999/com.hobeian/compare/v1.0.9...HEAD
+[Unreleased]: https://github.com/elrond1999/com.hobeian/compare/v1.0.10...HEAD
+[1.0.10]: https://github.com/elrond1999/com.hobeian/compare/v1.0.9...v1.0.10
 [1.0.9]: https://github.com/elrond1999/com.hobeian/compare/v1.0.8...v1.0.9
 [1.0.8]: https://github.com/elrond1999/com.hobeian/compare/f6b925c...v1.0.8
 [1.0.7]: https://github.com/elrond1999/com.hobeian/compare/v1.0.6...f6b925c

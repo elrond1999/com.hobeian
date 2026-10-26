@@ -3,18 +3,37 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('node:module');
+const { EventEmitter } = require('node:events');
 const driver = require('../drivers/ay-303z/driver.compose.json');
 
 class FakeDevice {
   constructor() {
     this.values = {};
     this.settings = { soil_warning: 30 };
+    this.store = {};
+    this.logs = [];
+    this.errors = [];
+    this.error = (...args) => this.errors.push(args);
   }
 
-  log() {}
+  log(...args) {
+    this.logs.push(args);
+  }
 
-  error(error) {
-    throw error;
+  getSettings() {
+    return this.settings;
+  }
+
+  getStoreValue(key) {
+    return this.store[key];
+  }
+
+  async setStoreValue(key, value) {
+    this.store[key] = structuredClone(value);
+  }
+
+  async setAvailable() {
+    return undefined;
   }
 
   getSetting(key) {
@@ -38,7 +57,7 @@ const originalLoad = Module._load;
 Module._load = function load(request, ...args) {
   if (request === 'homey-zigbeedriver') return { ZigBeeDevice: FakeDevice };
   if (request === 'zigbee-clusters') {
-    return { Cluster: FakeCluster, ZCLDataTypes: {}, CLUSTER: {} };
+    return { Cluster: FakeCluster, ZCLDataTypes: {}, CLUSTER: { POWER_CONFIGURATION: { NAME: 'powerConfiguration' } } };
   }
   return originalLoad.call(this, request, ...args);
 };
@@ -169,4 +188,107 @@ test('AY-303Z pairing accepts the padded manufacturer and excludes unrelated mod
   assert.ok(driver.zigbee.manufacturerName.includes('AOYAN  '));
   assert.ok(driver.zigbee.manufacturerName.includes('AOYAN'));
   assert.deepEqual(driver.zigbee.productId, ['AY-303Z']);
+});
+
+async function sleepyFixture(Device = AY303ZDevice, previous) {
+  const device = new Device();
+  device.node = { receiveWhenIdle: false };
+  if (previous) {
+    device.store = structuredClone(previous.store);
+    device.settings = { ...previous.settings };
+  }
+  const writes = [];
+  const cluster = new EventEmitter();
+  cluster.setDatapointValue = async (dp, value) => {
+    writes.push({ dp, value });
+    if (cluster.failDp === dp) throw new Error('Wake window closed');
+  };
+  cluster.setDatapointEnum = async (dp, value) => writes.push({ dp, value });
+  const endpoint = { clusters: { tuya: cluster }, handleFrame() {} };
+  await device.onNodeInit({ zclNode: { endpoints: { 1: endpoint } } });
+  return {
+    device, writes, cluster, endpoint,
+  };
+}
+
+async function editSettings(device, changes) {
+  const newSettings = { ...device.settings, ...changes };
+  await device.onSettings({ oldSettings: device.settings, newSettings, changedKeys: Object.keys(changes) });
+  device.settings = newSettings;
+}
+
+test('sleepy soil sensors retry only unsent edits after failure and across restart', async (t) => {
+  let now = 100000;
+  t.mock.method(Date, 'now', () => now);
+  for (const Device of [AY303ZDevice, ZG303ZDevice]) {
+    const first = await sleepyFixture(Device);
+    await editSettings(first.device, { temperature_sampling: 300, soil_sampling: 600 });
+    assert.deepEqual(first.writes, []);
+    first.cluster.failDp = 112;
+    await first.device.onEndDeviceAnnounce();
+    assert.ok(first.writes.some(({ dp }) => dp === 112));
+    assert.equal(first.device.errors.length, 1);
+    const restarted = await sleepyFixture(Device, first.device);
+    assert.deepEqual(restarted.writes, []);
+    now += 6000;
+    await restarted.device.onEndDeviceAnnounce();
+    assert.deepEqual(restarted.writes, [{ dp: 112, value: 600 }]);
+    now += 6000;
+    await restarted.device.onEndDeviceAnnounce();
+    assert.equal(restarted.writes.length, 1);
+  }
+});
+
+test('soil sensor edits survive restart before any wake and use the saved requested value', async () => {
+  const first = await sleepyFixture();
+  await editSettings(first.device, { humidity_calibration: -28 });
+  const restarted = await sleepyFixture(AY303ZDevice, first.device);
+  await restarted.device.onEndDeviceAnnounce();
+  assert.deepEqual(restarted.writes, [{ dp: 105, value: -28 }]);
+});
+
+test('a newer edit survives an in-flight wake write and overlapping wakes do not duplicate it', async (t) => {
+  let now = 100000;
+  t.mock.method(Date, 'now', () => now);
+  const { device, writes, cluster } = await sleepyFixture();
+  await editSettings(device, { soil_sampling: 300 });
+  let release;
+  let entered;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const send = cluster.setDatapointValue;
+  cluster.setDatapointValue = async (...args) => {
+    entered();
+    await gate;
+    return send(...args);
+  };
+  const wake = device.onEndDeviceAnnounce();
+  await started;
+  await editSettings(device, { soil_sampling: 600 });
+  now += 6000;
+  await device.onEndDeviceAnnounce();
+  release();
+  await wake;
+  cluster.setDatapointValue = send;
+  now += 6000;
+  await device.onEndDeviceAnnounce();
+  assert.deepEqual(writes, [{ dp: 112, value: 300 }, { dp: 112, value: 600 }]);
+});
+
+test('reported settings distinguish matching and mismatching sensor values in diagnostics', async () => {
+  const { device, endpoint } = await sleepyFixture();
+  device.settings.soil_sampling = 300;
+  for (const value of [60, 300]) {
+    // Fixed Tuya report: ZCL header, status/transaction, DP112 VALUE, length4.
+    const frame = Buffer.from([0x19, 1, 1, 0, 1, 112, 2, 0, 4, 0, 0, value >> 8, value & 255]);
+    endpoint.handleFrame(0xef00, frame, {});
+  }
+  const reports = device.logs.filter(([message]) => message === 'Soil sensor reported setting');
+  assert.deepEqual(reports.map(([, details]) => ({
+    raw: details.rawValue, requested: details.requestedRawValue, matches: details.matchesRequested,
+  })), [{ raw: 60, requested: 300, matches: false }, { raw: 300, requested: 300, matches: true }]);
 });

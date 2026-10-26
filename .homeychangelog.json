@@ -28,5 +28,8 @@
   },
   "1.0.9": {
     "en": "Remove the experimental label from AY-303Z support after successful testing on three units. Refresh the app artwork and listing description to reflect supported Hobeian Zigbee sensors."
+  },
+  "1.0.10": {
+    "en": "Improve AY-303Z and ZG-303Z settings delivery: retry failed changes after wake-up, preserve pending changes across app restarts, and add diagnostics for requested and sensor-reported settings. Includes refreshed app descriptions and device photos."
   }
 }

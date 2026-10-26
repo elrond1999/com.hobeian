@@ -1,6 +1,6 @@
 {
   "name": "com.hobeian",
-  "version": "1.0.7",
+  "version": "1.0.10",
   "scripts": {
     "build": "npx --no-install tsc",
     "lint": "npx --no-install eslint --ext .js,.ts --ignore-path .gitignore --ignore-pattern \"types/**\" --ignore-pattern \".homeybuild/**\" .",
@@ -17,5 +17,8 @@
     "eslint": "^7.32.0",
     "eslint-config-athom": "^3.1.5",
     "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

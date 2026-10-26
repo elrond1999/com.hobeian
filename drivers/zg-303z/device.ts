@@ -17,6 +17,18 @@ import {
 } from '../../lib/zg303z';
 import { DP_HANDLERS, DP_WRITE, DEFAULTS } from '../../lib/zg303zDatapoints';
 
+const PENDING_SETTINGS_STORE_KEY = 'soilSensorPendingSettings';
+const SETTING_WRITES = {
+  temperature_sampling: { dp: 'TEMP_SAMPLING_INTERVAL', convert: toTuyaSamplingSeconds, fallback: DEFAULTS.SAMPLING_SECONDS },
+  soil_sampling: { dp: 'SOIL_SAMPLING_INTERVAL', convert: toTuyaSamplingSeconds, fallback: DEFAULTS.SAMPLING_SECONDS },
+  soil_warning: { dp: 'SOIL_WARNING_THRESHOLD', convert: toTuyaSoilWarningThresholdPercent, fallback: DEFAULTS.SOIL_WARNING_PERCENT },
+  temperature_calibration: { dp: 'TEMP_CALIBRATION', convert: toTuyaTemperatureCalibrationTenths, fallback: DEFAULTS.CALIBRATION },
+  humidity_calibration: { dp: 'HUMIDITY_CALIBRATION', convert: toTuyaPercentCalibration, fallback: DEFAULTS.CALIBRATION },
+  soil_calibration: { dp: 'SOIL_CALIBRATION', convert: toTuyaPercentCalibration, fallback: DEFAULTS.CALIBRATION },
+} as const;
+type SettingKey = keyof typeof SETTING_WRITES;
+type PendingSetting = { value: number };
+
 module.exports = class ZG303ZDevice extends ZigBeeDevice {
 
   protected datapointHandlers = DP_HANDLERS;
@@ -25,12 +37,19 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
 
   private tuyaCluster: any = null;
   private lastSoilMoisturePercent?: number;
-  private pendingSettingsApply = false;
+  private pendingSettings: Partial<Record<SettingKey, PendingSetting>> = {};
+  private settingsApplyInProgress = false;
+  private pendingStoreWrite: Promise<void> = Promise.resolve();
   private endpoint1: any = null;
   private lastWakeHandledAt = 0;
 
   async onNodeInit({ zclNode }: { zclNode: any }) {
     this.log('ZG-303Z device initialized');
+    this.pendingSettings = this.getStoreValue(PENDING_SETTINGS_STORE_KEY) ?? {};
+    this.log('Soil sensor settings at startup', {
+      configured: this.getSettings(),
+      pending: this.pendingSettings,
+    });
 
     // This Tuya device supports configuring sampling/calibration via datapoints on 0xEF00.
 
@@ -88,12 +107,15 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
     // For sleepy devices, defer commands until device wakes up
     // For always-on devices, apply settings immediately
     if (isSleepy) {
-      this.log('Device is sleepy - will apply settings and read battery when device wakes up');
-      // Do NOT set pendingSettingsApply = true here - no user changes pending yet
+      this.log('Device is sleepy - pending user settings will be sent on its next report or announce');
     } else {
       // Device is always-on, apply settings immediately
       if (this.tuyaCluster) {
-        await this.applyDeviceSettings().catch(this.error);
+        if (Object.keys(this.pendingSettings).length > 0) {
+          await this.applyPendingSettings().catch(this.error);
+        } else {
+          await this.applyDeviceSettings().catch(this.error);
+        }
       }
       await this.readBattery(endpoint).catch(this.error);
     }
@@ -101,34 +123,53 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
 
   private async applyDeviceSettings(): Promise<void> {
     if (!this.tuyaCluster) return;
-
-    const temperatureSampling = toTuyaSamplingSeconds(this.getSetting('temperature_sampling') ?? DEFAULTS.SAMPLING_SECONDS);
-    const soilSampling = toTuyaSamplingSeconds(this.getSetting('soil_sampling') ?? DEFAULTS.SAMPLING_SECONDS);
-    const soilWarning = toTuyaSoilWarningThresholdPercent(this.getSetting('soil_warning') ?? DEFAULTS.SOIL_WARNING_PERCENT);
-
-    // Calibrations
-    const temperatureCalibrationTenths = toTuyaTemperatureCalibrationTenths(this.getSetting('temperature_calibration') ?? DEFAULTS.CALIBRATION);
-    const humidityCalibration = toTuyaPercentCalibration(this.getSetting('humidity_calibration') ?? DEFAULTS.CALIBRATION);
-    const soilCalibration = toTuyaPercentCalibration(this.getSetting('soil_calibration') ?? DEFAULTS.CALIBRATION);
-
-    // Best-effort: device may be sleeping; will apply on next awake/report window.
     await this.tuyaCluster.setDatapointEnum?.(this.writeDatapoints.TEMP_UNIT, 0); // enforce Celsius
-    await this.tuyaCluster.setDatapointValue(this.writeDatapoints.TEMP_SAMPLING_INTERVAL, temperatureSampling);
-    await this.tuyaCluster.setDatapointValue(this.writeDatapoints.SOIL_SAMPLING_INTERVAL, soilSampling);
-    await this.tuyaCluster.setDatapointValue(this.writeDatapoints.SOIL_WARNING_THRESHOLD, soilWarning);
+    for (const key of Object.keys(SETTING_WRITES) as SettingKey[]) {
+      const config = SETTING_WRITES[key];
+      await this.writeSetting(key, config.convert(this.getSetting(key) ?? config.fallback));
+    }
+  }
 
-    await this.tuyaCluster.setDatapointValue(this.writeDatapoints.TEMP_CALIBRATION, temperatureCalibrationTenths);
-    await this.tuyaCluster.setDatapointValue(this.writeDatapoints.HUMIDITY_CALIBRATION, humidityCalibration);
-    await this.tuyaCluster.setDatapointValue(this.writeDatapoints.SOIL_CALIBRATION, soilCalibration);
+  private async writeSetting(key: SettingKey, value: number): Promise<void> {
+    const dp = this.writeDatapoints[SETTING_WRITES[key].dp];
+    this.log('Sending soil sensor setting', { key, dp, rawValue: value });
+    await this.tuyaCluster.setDatapointValue(dp, value);
+    this.log('Soil sensor setting sent (device value not yet confirmed)', { key, dp, rawValue: value });
+  }
 
-    this.log('Applied device settings via Tuya DPs', {
-      temperatureSampling,
-      soilSampling,
-      soilWarning,
-      temperatureCalibrationTenths,
-      humidityCalibration,
-      soilCalibration,
-    });
+  private persistPendingSettings(): Promise<void> {
+    // Serialize snapshots so an older save cannot overwrite a newer edit.
+    const snapshot = { ...this.pendingSettings };
+    const write = this.pendingStoreWrite.then(() => this.setStoreValue(PENDING_SETTINGS_STORE_KEY, snapshot));
+    this.pendingStoreWrite = write.catch(() => {});
+    return write;
+  }
+
+  private async applyPendingSettings(): Promise<void> {
+    if (!this.tuyaCluster || this.settingsApplyInProgress) return;
+    this.settingsApplyInProgress = true;
+    try {
+      for (const [key, pending] of Object.entries(this.pendingSettings) as [SettingKey, PendingSetting][]) {
+        try {
+          await this.writeSetting(key, pending.value);
+        } catch (error) {
+          this.error('Soil sensor setting write failed; retained for next wake', { key, rawValue: pending.value }, error);
+          break;
+        }
+        // A newer edit of the same setting must survive this in-flight write.
+        if (this.pendingSettings[key] === pending) {
+          delete this.pendingSettings[key];
+          try {
+            await this.persistPendingSettings();
+          } catch (error) {
+            if (!this.pendingSettings[key]) this.pendingSettings[key] = pending;
+            throw error;
+          }
+        }
+      }
+    } finally {
+      this.settingsApplyInProgress = false;
+    }
   }
 
   /**
@@ -255,17 +296,17 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
    */
   private processDataPoint(dp: number, datatype: number, data: Buffer) {
     const mapping = this.datapointHandlers[dp];
-    
+
     if (!mapping) {
       this.log(`Unknown DP ${dp} (type: ${datatype})`);
       return;
     }
 
     const rawValue = this.parseDpValue(datatype, data);
-    
+
     // Apply divideBy transformation if specified in mapping
-    const value = mapping.divideBy && typeof rawValue === 'number' 
-      ? rawValue / mapping.divideBy 
+    const value = mapping.divideBy && typeof rawValue === 'number'
+      ? rawValue / mapping.divideBy
       : rawValue;
 
     this.log(`Processing DP ${dp} = ${value} (handler: ${mapping.handler})`);
@@ -338,7 +379,21 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
         break;
 
       case 'setting':
-        this.log(`Setting DP ${dp} confirmed: ${value}`);
+        {
+          const key = (Object.keys(SETTING_WRITES) as SettingKey[])
+            .find((candidate) => this.writeDatapoints[SETTING_WRITES[candidate].dp] === dp);
+          const config = key ? SETTING_WRITES[key] : undefined;
+          const requested = config && key ? config.convert(this.getSetting(key) ?? config.fallback) : undefined;
+          this.log('Soil sensor reported setting', {
+            dp,
+            key,
+            rawValue: value,
+            requestedRawValue: requested,
+            matchesRequested: requested === undefined ? undefined : requested === value,
+          });
+        }
+        break;
+      default:
         break;
     }
   }
@@ -374,40 +429,14 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
   }): Promise<void> {
     this.log('Settings changed:', changedKeys);
 
-    const isSleepy = this.isDeviceSleepy();
-
-    // For sleepy devices, queue settings for when device wakes up
-    if (isSleepy) {
-      this.log('Device is sleepy - queueing settings for next wake-up');
-      this.pendingSettingsApply = true;
-    } else if (this.tuyaCluster) {
-      // Device is always-on, apply settings immediately
-      for (const key of changedKeys) {
-        const value = newSettings[key];
-        try {
-          if (key === 'temperature_sampling') {
-            await this.tuyaCluster.setDatapointValue(this.writeDatapoints.TEMP_SAMPLING_INTERVAL, toTuyaSamplingSeconds(value ?? DEFAULTS.SAMPLING_SECONDS));
-          }
-          if (key === 'soil_sampling') {
-            await this.tuyaCluster.setDatapointValue(this.writeDatapoints.SOIL_SAMPLING_INTERVAL, toTuyaSamplingSeconds(value ?? DEFAULTS.SAMPLING_SECONDS));
-          }
-          if (key === 'soil_warning') {
-            await this.tuyaCluster.setDatapointValue(this.writeDatapoints.SOIL_WARNING_THRESHOLD, toTuyaSoilWarningThresholdPercent(value ?? DEFAULTS.SOIL_WARNING_PERCENT));
-          }
-          if (key === 'temperature_calibration') {
-            await this.tuyaCluster.setDatapointValue(this.writeDatapoints.TEMP_CALIBRATION, toTuyaTemperatureCalibrationTenths(value ?? DEFAULTS.CALIBRATION));
-          }
-          if (key === 'humidity_calibration') {
-            await this.tuyaCluster.setDatapointValue(this.writeDatapoints.HUMIDITY_CALIBRATION, toTuyaPercentCalibration(value ?? DEFAULTS.CALIBRATION));
-          }
-          if (key === 'soil_calibration') {
-            await this.tuyaCluster.setDatapointValue(this.writeDatapoints.SOIL_CALIBRATION, toTuyaPercentCalibration(value ?? DEFAULTS.CALIBRATION));
-          }
-        } catch (err) {
-          this.error('Failed to apply setting to device:', err);
-        }
-      }
+    for (const key of Object.keys(SETTING_WRITES) as SettingKey[]) {
+      if (!changedKeys.includes(key)) continue;
+      const config = SETTING_WRITES[key];
+      this.pendingSettings[key] = { value: config.convert(newSettings[key] ?? config.fallback) };
+      this.log('Queued soil sensor setting', { key, requested: newSettings[key], rawValue: this.pendingSettings[key]?.value });
     }
+    await this.persistPendingSettings();
+    if (!this.isDeviceSleepy()) await this.applyPendingSettings();
 
     // Only models using the local fallback recompute before hardware confirms.
     if (this.deriveWaterAlarmFromSoilMoisture && changedKeys.includes('soil_warning')) {
@@ -489,10 +518,9 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
     await this.setAvailable().catch(this.error);
 
     // Only apply settings if user changed them while device was sleeping
-    if (this.pendingSettingsApply) {
-      this.log('Applying pending user settings...');
-      await this.applyDeviceSettings().catch(this.error);
-      this.pendingSettingsApply = false;
+    if (Object.keys(this.pendingSettings).length > 0) {
+      this.log('Applying pending user settings...', this.pendingSettings);
+      await this.applyPendingSettings().catch(this.error);
     }
 
     // Read battery status
