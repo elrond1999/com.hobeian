@@ -33,6 +33,7 @@ const SETTING_WRITES = {
 } as const;
 type SettingKey = keyof typeof SETTING_WRITES;
 type PendingSetting = { value: number };
+type RawTuyaReport = { transid?: number; datapoints: Set<string> };
 
 module.exports = class ZG303ZDevice extends ZigBeeDevice {
 
@@ -50,7 +51,7 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
   private diagnostics = new SoilDiagnostics();
   private diagnosticTimer?: NodeJS.Timeout;
   private diagnosticStoreWrite: Promise<void> = Promise.resolve();
-  private interceptsRawTuya = false;
+  private rawTuyaReports = new Set<RawTuyaReport>();
 
   async onNodeInit({ zclNode }: { zclNode: any }) {
     this.log('ZG-303Z device initialized');
@@ -290,19 +291,24 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
     // Intercept handleFrame for the Tuya cluster
     const originalHandleFrame = endpoint.handleFrame?.bind(endpoint);
     if (originalHandleFrame) {
-      this.interceptsRawTuya = true;
-      endpoint.handleFrame = (clusterId: number, frame: Buffer, meta: any) => {
+      endpoint.handleFrame = async (clusterId: number, frame: Buffer, meta: any) => {
+        let rawReport: RawTuyaReport | undefined;
         const observedClusters: number[] = [TUYA_CLUSTER_ID, NATIVE_TEMPERATURE_CLUSTER, NATIVE_HUMIDITY_CLUSTER];
         if (observedClusters.includes(clusterId)) {
           this.diagnostics.frame(clusterId, frame);
         }
         if (clusterId === TUYA_CLUSTER_ID) {
-          this.parseRawTuyaFrame(frame);
+          rawReport = this.parseRawTuyaFrame(frame);
+          this.rawTuyaReports.add(rawReport);
 
           // Device is awake since we received data - trigger wake handler
           this.onDeviceAwake().catch(this.error);
         }
-        return originalHandleFrame(clusterId, frame, meta);
+        try {
+          return await originalHandleFrame(clusterId, frame, meta);
+        } finally {
+          if (rawReport) this.rawTuyaReports.delete(rawReport);
+        }
       };
       this.log('Registered raw frame handler for Tuya cluster');
     }
@@ -313,33 +319,42 @@ module.exports = class ZG303ZDevice extends ZigBeeDevice {
    * Parse a raw Tuya frame
    */
   private parseRawTuyaFrame(frame: Buffer) {
+    const report: RawTuyaReport = { datapoints: new Set() };
     try {
       const decoded = decodeTuyaDpValuesFromZclFrame(frame);
+      report.transid = decoded.transid;
       if (decoded.dpValues.length === 0) {
         this.diagnostics.sample(`tuya.command${decoded.commandId}.withoutDatapoints`, decoded.status ?? -1);
-        return;
+        return report;
       }
 
       for (const dpValue of decoded.dpValues) {
         this.processDataPoint(dpValue.dp, dpValue.datatype, dpValue.data);
+        report.datapoints.add(`${dpValue.dp}:${dpValue.datatype}:${dpValue.data.toString('hex')}`);
       }
     } catch (error) {
       this.diagnostics.error('Tuya frame decode', error);
       this.error('Error parsing raw Tuya frame:', error);
     }
+    return report;
   }
 
   /**
    * Process a Tuya report
    */
   private processTuyaReport(args: any) {
-    // The same packet must not be counted twice if the cluster also emits an event.
-    if (!args || this.interceptsRawTuya) return;
+    if (!args) return;
 
     const { dp, datatype, data } = args;
 
     if (typeof dp === 'number' && data) {
-      this.processDataPoint(dp, datatype || 0, Buffer.isBuffer(data) ? data : Buffer.from([data]));
+      const bytes = Buffer.isBuffer(data) ? data : Buffer.from([data]);
+      const key = `${dp}:${datatype || 0}:${bytes.toString('hex')}`;
+      // Suppress only successful raw handling of this packet; decoding failures
+      // and datapoints not handled by the raw decoder retain their fallback.
+      const handled = [...this.rawTuyaReports].some((report) => (args.transid === undefined || report.transid === args.transid)
+        && report.datapoints.has(key));
+      if (!handled) this.processDataPoint(dp, datatype || 0, bytes);
     }
   }
 

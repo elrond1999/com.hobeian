@@ -214,7 +214,7 @@ test('AY-303Z pairing accepts the padded manufacturer and excludes unrelated mod
   assert.deepEqual(driver.zigbee.productId, ['AY-303Z']);
 });
 
-async function sleepyFixture(Device = AY303ZDevice, previous) {
+async function sleepyFixture(Device = AY303ZDevice, previous, handleFrame) {
   const device = new Device();
   device.node = { receiveWhenIdle: false };
   if (previous) {
@@ -230,7 +230,9 @@ async function sleepyFixture(Device = AY303ZDevice, previous) {
   cluster.setDatapointEnum = async (dp, value) => writes.push({ dp, value });
   const endpoint = {
     clusters: { tuya: cluster, temperatureMeasurement: new EventEmitter(), relativeHumidity: new EventEmitter() },
-    handleFrame() {},
+    handleFrame(clusterId, frame) {
+      return handleFrame?.(cluster, clusterId, frame);
+    },
   };
   await device.onNodeInit({ zclNode: { endpoints: { 1: endpoint } } });
   return {
@@ -448,4 +450,22 @@ test('capability publication errors remain visible separately from incoming meas
   assert.equal(state.channels['tuya.dp5.type2'].count, 1);
   assert.equal(state.channels['homey.measure_temperature'], undefined);
   assert.ok(state.errors.some(({ context, message }) => context === 'Capability measure_temperature' && message.includes('Homey rejected update')));
+});
+
+test('cluster event fallback survives empty or failed raw decoding without double-counting decoded packets', async () => {
+  const cases = [
+    Buffer.from([0x19, 1, 2, 0, 1]),
+    Buffer.from([0x19, 1, 2, 0, 1, 5, 2, 0, 0]),
+    Buffer.from([0x19, 1, 2, 0, 1, 5, 2, 0, 4, 0, 0, 0, 211]),
+  ];
+  for (const frame of cases) {
+    const { device, endpoint } = await sleepyFixture(AY303ZDevice, undefined, (cluster) => {
+      cluster.emit('response', {
+        transid: 1, dp: 5, datatype: 2, data: Buffer.from([0, 0, 0, 211]),
+      });
+    });
+    await endpoint.handleFrame(0xef00, frame, {});
+    assert.equal(device.values.measure_temperature, 21.1);
+    assert.equal(device.getDiagnosticsSnapshot().channels['tuya.dp5.type2'].count, 1);
+  }
 });
